@@ -1,0 +1,63 @@
+name: upstream
+
+# A new upstream base is a decision, not an update: it moves the extensions Immich's indexes were written
+# with. So this opens a PR and never pushes to main.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare pinned base with upstream's current digest
+        id: cmp
+        run: |
+          set -euo pipefail
+          ref=$(grep -oP '^ARG BASE=\K.*' Dockerfile)
+          repo=${ref%@*}
+          pinned=${ref##*@}
+          tag=${repo##*:}
+          repo=${repo%:*}
+          token=$(curl -fsS "https://ghcr.io/token?scope=repository:${repo#ghcr.io/}:pull&service=ghcr.io" | jq -r .token)
+          live=$(curl -fsSI -H "Authorization: Bearer $token" \
+            -H 'Accept: application/vnd.oci.image.index.v1+json,application/vnd.docker.distribution.manifest.list.v2+json' \
+            "https://ghcr.io/v2/${repo#ghcr.io/}/manifests/${tag}" \
+            | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}')
+          echo "pinned=$pinned"; echo "live=$live"
+          echo "repo=$repo" >> "$GITHUB_OUTPUT"; echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "live=$live" >> "$GITHUB_OUTPUT"
+          if [ -z "$live" ]; then echo "::error::could not read upstream digest"; exit 1; fi
+          if [ "$pinned" = "$live" ]; then echo "changed=false" >> "$GITHUB_OUTPUT";
+          else echo "changed=true" >> "$GITHUB_OUTPUT"; fi
+
+      - name: Open a PR for the new base
+        if: steps.cmp.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          new="${{ steps.cmp.outputs.repo }}:${{ steps.cmp.outputs.tag }}@${{ steps.cmp.outputs.live }}"
+          sed -i -E "s#^ARG BASE=.*#ARG BASE=${new}#; s#^ARG BASE_DIGEST=.*#ARG BASE_DIGEST=${{ steps.cmp.outputs.live }}#" Dockerfile
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "upstream/base-${{ github.run_id }}"
+          git commit -am "chore(base): upstream moved to ${{ steps.cmp.outputs.live }}"
+          git push -u origin HEAD
+          gh pr create --title "chore(base): upstream moved to ${{ steps.cmp.outputs.live }}" --body \
+            "Immich's Postgres image moved upstream.
+
+          \`\`\`
+          was  ${{ steps.cmp.outputs.pinned || 'see diff' }}
+          now  ${new}
+          \`\`\`
+
+          **Read the diff before merging.** This changes the extensions Immich's indexes were written with; a
+          major-version or extension bump is a migration, not a rebuild. The build workflow re-proves \`initdb\` as
+          uid 26 and that \`vchord.so\`/\`vector.so\` are present, which is necessary and not sufficient."
