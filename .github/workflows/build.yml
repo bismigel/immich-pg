@@ -59,8 +59,11 @@ jobs:
         with:
           context: .
           push: true
+          # The tag is the Postgres version, not `latest` or a commit sha: CloudNativePG parses `imageName`'s tag
+          # to decide whether an update is within the same major version, and rejects tags it cannot read
+          # ("invalid version tag"). The digest is what actually decides what runs (ADR 0007).
           tags: |
-            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:14.19
             ghcr.io/${{ github.repository }}:${{ github.sha }}
           cache-from: type=gha
 
