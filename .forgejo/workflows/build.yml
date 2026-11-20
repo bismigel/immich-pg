@@ -39,6 +39,13 @@ jobs:
           mkdir -p "$TMPDIR"
           tag="14.19"
 
+          # Clean up before building, not only after. buildah's store lives on the runner's scratch PVC, and
+          # local-path does not enforce its size: on 2026-11-20 it had grown to 20 GiB against a 5 GiB claim and
+          # filled the node, which evicted this very runner for ephemeral-storage pressure. Starting clean bounds
+          # it at one image plus one container per run; the end-of-run cleanup below is the belt to that braces.
+          buildah --storage-driver vfs rm --all >/dev/null 2>&1 || true
+          buildah --storage-driver vfs rmi --all >/dev/null 2>&1 || true
+
           echo "$REGISTRY_PASSWORD" | buildah --storage-driver vfs login \
             --tls-verify=false --username bismigel --password-stdin 10.43.200.10:5000 >/dev/null
 
@@ -63,4 +70,7 @@ jobs:
           digest=$(cat /tmp/pushed.digest)
           echo "IMAGE=registry.bismigel.dev/bismigel/immich-pg:${tag}@${digest}"
           echo "digest ${digest}" >> "$GITHUB_STEP_SUMMARY"
+          # Leave nothing behind: the image and the pulled base both occupy the scratch PVC, and this workflow
+          # runs on every merge to main.
           buildah --storage-driver vfs rm "immich-pg:${tag}" >/dev/null 2>&1 || true
+          buildah --storage-driver vfs rmi --all >/dev/null 2>&1 || true
