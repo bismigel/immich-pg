@@ -1,9 +1,11 @@
-# Build Immich's derived Postgres image and push it to the estate's own registry (Forgejo's), so the
-# build no longer depends on GitHub's hosted runners or ghcr.io.
+# Build Immich's derived Postgres image and push it to the estate's registry (zot).
 #
-# Same shape as bakuran-gitops' checks-image.yml: buildah (no Docker daemon in the runner), vfs storage
-# driver (no privileges), push by digest. The tag stays `14.19` - CNPG parses it to judge major-version
-# upgrades and rejects a sha or a commit tag ("invalid version tag").
+# The canonical pattern here, copied from media-mcp rather than invented: buildah (the runner has no Docker
+# daemon), push to zot at its pinned ClusterIP from CI (the runner has no /etc/hosts entry for the readable
+# name), and store the readable name + digest in the manifest.
+#
+# The tag stays `14.19`: CloudNativePG parses it to decide whether a change is within one major version and
+# rejects a commit sha as "invalid version tag". The digest decides what runs (ADR 0007).
 name: build
 
 on:
@@ -11,45 +13,54 @@ on:
     branches: [main]
   workflow_dispatch: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build:
+  image:
     runs-on: in-cluster
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-
-      - name: Build, prove initdb as uid 26, and push
+      - name: Clone this repository
         env:
-          # write:package token for the `bismigel` user; the run token cannot push packages.
-          PKG_TOKEN: ${{ secrets.PACKAGE_TOKEN }}
+          REPO_READ_TOKEN: ${{ secrets.REPO_READ_TOKEN }}
         run: |
-          set -eu
-          tag="14.19"   # CNPG reads this; never change it to a commit sha
-          {
-            export BUILDAH_ISOLATION=chroot TMPDIR=/var/lib/containers/tmp
-            mkdir -p "$TMPDIR"
+          GIT_TERMINAL_PROMPT=0 git clone --quiet --depth 1 \
+            "http://bismigel:${REPO_READ_TOKEN}@forgejo.forgejo.svc.cluster.local:3000/bismigel/immich-pg.git" . \
+            2>/tmp/clone.err || { cat /tmp/clone.err; exit 1; }
 
-            echo "$PKG_TOKEN" | buildah --storage-driver vfs login \
-              --tls-verify=false --username bismigel --password-stdin forgejo.forgejo.svc:3000
+      - name: Build, prove initdb as uid 26, push
+        env:
+          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          export BUILDAH_ISOLATION=chroot TMPDIR=/var/lib/containers/tmp
+          mkdir -p "$TMPDIR"
+          tag="14.19"
 
-            buildah --storage-driver vfs bud -q --format oci -t "immich-pg:${tag}" -f Dockerfile .
+          echo "$REGISTRY_PASSWORD" | buildah --storage-driver vfs login \
+            --tls-verify=false --username bismigel --password-stdin 10.43.200.10:5000 >/dev/null
 
-            # The image is only useful if initdb runs at the uid CNPG uses (26). Building is not that test.
-            ctr=$(buildah --storage-driver vfs from "immich-pg:${tag}")
-            buildah --storage-driver vfs run --user 26 "$ctr" -- sh -c '
-              getent passwd 26
-              mkdir -p /tmp/pg
-              /usr/lib/postgresql/14/bin/initdb -D /tmp/pg --auth=trust >/dev/null
-              ls /usr/lib/postgresql/14/lib/ | grep -q "^vchord.so$"
-              ls /usr/lib/postgresql/14/lib/ | grep -q "^vector.so$"
-              echo "initdb ok, extensions present"'
-            buildah --storage-driver vfs rm "$ctr"
+          buildah --storage-driver vfs bud -q -t "immich-pg:${tag}" -f Dockerfile .
 
-            buildah --storage-driver vfs push --format oci --tls-verify=false --digestfile /tmp/pushed.digest \
-              "immich-pg:${tag}" "forgejo.forgejo.svc:3000/bismigel/immich-pg:${tag}"
-          } > /tmp/push.log 2>&1 || { echo "build/push failed:"; tail -25 /tmp/push.log; exit 1; }
+          # The image is only useful if initdb runs at the uid CNPG uses (26). Building is not that test.
+          ctr=$(buildah --storage-driver vfs from "immich-pg:${tag}")
+          buildah --storage-driver vfs run --user 26 "$ctr" -- sh -c '
+            getent passwd 26
+            mkdir -p /tmp/pg
+            /usr/lib/postgresql/14/bin/initdb -D /tmp/pg --auth=trust >/dev/null
+            ls /usr/lib/postgresql/14/lib/ | grep -q "^vchord.so$"
+            ls /usr/lib/postgresql/14/lib/ | grep -q "^vector.so$"
+            echo "initdb ok, extensions present"'
+          buildah --storage-driver vfs rm "$ctr"
 
-          echo "pushed bismigel/immich-pg:${tag} digest=$(cat /tmp/pushed.digest)"
-          echo "digest $(cat /tmp/pushed.digest)" >> "$GITHUB_STEP_SUMMARY"
+          buildah --storage-driver vfs push --format oci --tls-verify=false --digestfile /tmp/pushed.digest \
+            "immich-pg:${tag}" "10.43.200.10:5000/bismigel/immich-pg:${tag}"
+
+          # --digestfile, never `inspect .FromImageDigest`: that field is the BASE image's digest, and using it
+          # pinned a digest the registry never served (media-mcp hit exactly this on 2026-11-16).
+          digest=$(cat /tmp/pushed.digest)
+          echo "IMAGE=registry.bismigel.dev/bismigel/immich-pg:${tag}@${digest}"
+          echo "digest ${digest}" >> "$GITHUB_STEP_SUMMARY"
+          buildah --storage-driver vfs rm "immich-pg:${tag}" >/dev/null 2>&1 || true
