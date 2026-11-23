@@ -8,6 +8,12 @@
 # The Cluster CRD exposes no securityContext/runAsUser, so the fix is here: add uid 26, change nothing else.
 # Every extension (vchord 0.4.3, vector 0.8.1) stays exactly as Immich pin it, because those versions are
 # tied to index-format compatibility and re-deriving them is how data gets quietly corrupted.
+#
+# Rebuilt 2026-11-23 because the registry lost the manifest and blobs for the image the cluster
+# pinned: `registry.bismigel.dev` answered 503 by attempting an on-demand Docker Hub sync it has
+# no credentials for, and the node caches could not be transplanted (manifest present, blob
+# `sha256:017a5f1b…` pruned). Same Dockerfile, same pinned base, new digest; the CNPG cluster's
+# imageName is re-pinned to it in bakuran-gitops. Nothing else about the image changed.
 ARG BASE=ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
 FROM ${BASE}
 
