@@ -1,8 +1,7 @@
-# Build Immich's derived Postgres image and push it to the estate's registry (zot).
+# Build Immich's derived Postgres image and push it to GHCR, not zot (ADR 0021).
 #
 # The canonical pattern here, copied from media-mcp rather than invented: buildah (the runner has no Docker
-# daemon), push to zot at its pinned ClusterIP from CI (the runner has no /etc/hosts entry for the readable
-# name), and store the readable name + digest in the manifest.
+# daemon), push to ghcr.io over HTTPS from CI, and store the readable name + digest in the manifest.
 #
 # The tag stays `14.19`: CloudNativePG parses it to decide whether a change is within one major version and
 # rejects a commit sha as "invalid version tag". The digest decides what runs (ADR 0007).
@@ -32,7 +31,7 @@ jobs:
 
       - name: Build, prove initdb as uid 26, push
         env:
-          REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
         run: |
           set -euo pipefail
           export BUILDAH_ISOLATION=chroot TMPDIR=/var/lib/containers/tmp
@@ -46,10 +45,12 @@ jobs:
           buildah --storage-driver vfs rm --all >/dev/null 2>&1 || true
           buildah --storage-driver vfs rmi --all >/dev/null 2>&1 || true
 
-          echo "$REGISTRY_PASSWORD" | buildah --storage-driver vfs login \
-            --tls-verify=false --username bismigel --password-stdin 10.43.200.10:5000 >/dev/null
+          echo "$GHCR_TOKEN" | buildah --storage-driver vfs login \
+            --username bismigel --password-stdin ghcr.io >/dev/null
 
-          buildah --storage-driver vfs bud -q -t "immich-pg:${tag}" -f Dockerfile .
+          buildah --storage-driver vfs bud -q -t "immich-pg:${tag}" \
+            --label "org.opencontainers.image.source=https://github.com/bismigel/immich-pg" \
+            -f Dockerfile .
 
           # The image is only useful if initdb runs at the uid CNPG uses (26). Building is not that test.
           ctr=$(buildah --storage-driver vfs from "immich-pg:${tag}")
@@ -62,13 +63,24 @@ jobs:
             echo "initdb ok, extensions present"'
           buildah --storage-driver vfs rm "$ctr"
 
-          buildah --storage-driver vfs push --format oci --tls-verify=false --digestfile /tmp/pushed.digest \
-            "immich-pg:${tag}" "10.43.200.10:5000/bismigel/immich-pg:${tag}"
+          buildah --storage-driver vfs push --format oci --digestfile /tmp/pushed.digest \
+            "immich-pg:${tag}" "ghcr.io/bismigel/immich-pg:${tag}"
 
           # --digestfile, never `inspect .FromImageDigest`: that field is the BASE image's digest, and using it
           # pinned a digest the registry never served (media-mcp hit exactly this on 2026-11-16).
           digest=$(cat /tmp/pushed.digest)
-          echo "IMAGE=registry.bismigel.dev/bismigel/immich-pg:${tag}@${digest}"
+
+          # ADR 0007: prove GHCR resolves the tag to exactly what the push reported, not merely that push exited 0.
+          tok=$(curl -fsS -m 30 -u "bismigel:${GHCR_TOKEN}" \
+            "https://ghcr.io/token?service=ghcr.io&scope=repository:bismigel/immich-pg:pull" | jq -r .token)
+          reg=$(curl -fsS -m 30 -o /dev/null -D - \
+            -H "Authorization: Bearer ${tok}" \
+            -H 'Accept: application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
+            "https://ghcr.io/v2/bismigel/immich-pg/manifests/${tag}" \
+            | tr -d '\r' | awk -F': ' 'tolower($1)=="docker-content-digest"{print $2}')
+          [ "$reg" = "$digest" ] || { echo "GHCR says immich-pg:${tag} is ${reg:-nothing}, push said ${digest}"; exit 1; }
+
+          echo "IMAGE=ghcr.io/bismigel/immich-pg:${tag}@${digest}"
           echo "digest ${digest}" >> "$GITHUB_STEP_SUMMARY"
           # Leave nothing behind: the image and the pulled base both occupy the scratch PVC, and this workflow
           # runs on every merge to main.
